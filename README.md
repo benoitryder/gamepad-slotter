@@ -25,3 +25,11 @@ Therefore, when the real controller is plugged in, it can only get the right slo
 Virtual controllers are created using [ViGEmClient](https://github.com/nefarius/ViGEmClient).
 They are all destroyed when the application exits.
 
+
+## How to build
+
+* MSYS2/mingw64 environement: run `make`
+* MSVC tools: run `cl /O1 /std:c++20 /EHs /I ViGEmClient/include /Fegamepad-slotter.exe main.cpp ViGEmClient/src/ViGEmClient.cpp xinput.lib setupapi.lib`
+
+C++20 support is required.
+
