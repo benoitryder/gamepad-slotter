@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <format>
 #include <iostream>
 #include <stdexcept>
@@ -15,6 +16,9 @@ namespace ranges = std::ranges;
 using namespace std::chrono_literals;
 
 
+// Code assume slot indexes are 1-character wide
+static_assert(XUSER_MAX_COUNT + 1 <= 9);
+
 /// Wrap ViGEmClient
 struct VigemClient {
   using Pad = PVIGEM_TARGET;
@@ -25,11 +29,7 @@ struct VigemClient {
       throw std::runtime_error("vigem_alloc() failed");
     }
 
-    auto const retval = vigem_connect(client);
-    if (!VIGEM_SUCCESS(retval)) {
-      throw std::runtime_error(std::format("ViGEm Bus connection failed with error code: 0x{:x}", static_cast<int>(retval)));
-    }
-
+    checkSuccess(vigem_connect(client), "vigem_connect() failed");
     m_client = client;
   }
 
@@ -40,10 +40,7 @@ struct VigemClient {
       throw std::runtime_error("vigem_target_x360_alloc() failed");
     }
 
-    auto const retval = vigem_target_add(m_client, pad);
-    if (!VIGEM_SUCCESS(retval)) {
-      throw std::runtime_error(std::format("Target plugin failed with error code: 0x{:x}", static_cast<int>(retval)));
-    }
+    checkSuccess(vigem_target_add(m_client, pad), "vigem_target_add() failed");
 
     m_pads.push_back(pad);
     return pad;
@@ -61,16 +58,6 @@ struct VigemClient {
     m_pads.erase(it);
   }
 
-  /// Get the slot index of a gamepad
-  size_t getPadIndex(Pad pad) const {
-    ULONG index = -1;
-    auto retval = vigem_target_x360_get_user_index(m_client, pad, &index);
-    if (!VIGEM_SUCCESS(retval)) {
-      throw std::runtime_error(std::format("vigem_target_x360_get_user_index() failed: 0x{:x}", static_cast<int>(retval)));
-    }
-    return index;
-  }
-
   ~VigemClient() {
     for (auto const& pad : m_pads) {
       vigem_target_remove(m_client, pad);
@@ -78,6 +65,14 @@ struct VigemClient {
     }
     vigem_disconnect(m_client);
     vigem_free(m_client);
+  }
+
+
+  /// Check a ViGEmClient, throw on error
+  static void checkSuccess(VIGEM_ERROR retval, char const* message) {
+    if (!VIGEM_SUCCESS(retval)) {
+      throw std::runtime_error(std::format("{}: 0x{:X}", message, static_cast<unsigned int>(retval)));
+    }
   }
 
   PVIGEM_CLIENT m_client;
@@ -104,7 +99,7 @@ struct ConnectedPads {
   /// Return true if given slot is plugged
   bool isPlugged(size_t index) const {
     if (index >= m_slots.size()) {
-      std::cerr << std::format("ERROR: invalid slot: {}\n", index);
+      std::cerr << std::format("ERROR: invalid slot: {}\n", index + 1);
     }
     return m_slots.at(index).m_plugged;
   }
@@ -112,12 +107,13 @@ struct ConnectedPads {
   /// Print the current state
   void printState() const {
     std::cout << "State:";
-    for (auto const& slot : m_slots) {
+    for (size_t i = 0; i < m_slots.size(); ++i) {
+      auto const& slot = m_slots[i];
       char state = '?';
       if (slot.m_plugged && slot.m_managed) {
         state = 'x';
       } else if (slot.m_plugged && !slot.m_managed) {
-        state = 'O';
+        state = '1' + i;
       } else if (!slot.m_plugged && slot.m_managed) {
         state = 'X';  // erroneous
       } else if (!slot.m_plugged && !slot.m_managed) {
@@ -133,16 +129,16 @@ struct ConnectedPads {
   /// Return `true` if state changed.
   bool updatePlugged() {
     bool changed = false;
-    for (size_t i = 0; i < XUSER_MAX_COUNT; ++i) {
+    for (size_t i = 0; i < m_slots.size(); ++i) {
       bool plugged = isPadPlugged(i);
       auto& slot = m_slots[i];
       // Log state changes and invalid states
       if (slot.m_managed) {
         if (!plugged) {
-          std::cerr << std::format("WARNING: virtual pad {} unplugged\n", i);
+          std::cerr << std::format("WARNING: virtual pad unplugged on slot {}\n", i + 1);
         }
       } else if (slot.m_plugged != plugged) {
-        std::cout << std::format("Pad {} {}\n", i, plugged ? "plugged" : "unplugged");
+        std::cout << std::format("Pad {} {}\n", i + 1, plugged ? "plugged" : "unplugged");
       }
 
       changed |= slot.m_plugged != plugged;
@@ -161,16 +157,36 @@ struct ConnectedPads {
       }
     }
 
+    // `vigem_target_x360_get_user_index()` is unreliable; it sometimes fails.
+    // Assume no new device is manually plugged in between and poll `XInputGetState()`
+    auto const pollNewIndex = [&]() -> size_t {
+      int constexpr timeout_tries = 100;
+      auto constexpr timeout_delay = 1000ms / timeout_tries;
+
+      for (int tries = 0; tries < timeout_tries; ++tries) {
+        for (size_t i = 0; i < m_slots.size(); ++i) {
+          if (m_slots[i].m_plugged) {
+            continue;  // don't poll already plugged slots
+          }
+          if (isPadPlugged(i)) {
+            return i;
+          }
+        }
+        std::this_thread::sleep_for(timeout_delay);
+      }
+      throw std::runtime_error("failed to get index of new virtual pad (timeout)");
+    };
+
     // Create pads for the unplugged slots
     for (int i = 0; i < free; ++i) {
       auto pad = m_client.addPad();
-      auto index = m_client.getPadIndex(pad);
+      size_t const index = pollNewIndex();
       auto& slot = m_slots.at(index);
       if (slot.m_managed) {
-        std::cerr << std::format("WARNING: virtual pad created on an already managed slot: {}\n", index);
+        std::cerr << std::format("WARNING: virtual pad created on an already managed slot: {}\n", index + 1);
         m_client.removePad(pad);
       } else if (slot.m_plugged) {
-        std::cerr << std::format("WARNING: virtual pad created on an already plugged slot: {}\n", index);
+        std::cerr << std::format("WARNING: virtual pad created on an already plugged slot: {}\n", index + 1);
         m_client.removePad(pad);
       } else {
         slot.m_plugged = true;
@@ -182,7 +198,7 @@ struct ConnectedPads {
     updatePlugged();  // will log unplugged managed pads
     for (size_t i = 0; i < m_slots.size(); ++i) {
       if (!m_slots[i].m_plugged) {
-        std::cerr << std::format("WARNING: slot {} still unplugged\n", i);
+        std::cerr << std::format("WARNING: slot {} still unplugged\n", i + 1);
       }
     }
   }
@@ -190,20 +206,43 @@ struct ConnectedPads {
   /// Free the given slot, if it is managed
   void freeSlot(size_t index) {
     if (index >= m_slots.size()) {
-      std::cerr << std::format("ERROR: invalid slot: {}\n", index);
+      std::cerr << std::format("ERROR: invalid slot: {}\n", index + 1);
     }
     auto& slot = m_slots.at(index);
     if (!slot.m_managed) {
-      std::cerr << std::format("ERROR: cannot free unmanaged slot: {}\n", index);
+      std::cerr << std::format("ERROR: cannot free unmanaged slot: {}\n", index + 1);
       return;
     }
 
     m_client.removePad(slot.m_managed);
     slot.m_managed = nullptr;
-    slot.m_plugged = isPadPlugged(index);
-    if (!slot.m_plugged) {
-      std::cerr << std::format("WARNING: managed slot {} has been freed but is still plugged\n", index);
+
+    // Wait for pad to be actually unplugged
+    int constexpr timeout_tries = 100;
+    auto constexpr timeout_delay = 1000ms / timeout_tries;
+    for (int tries = 0; tries < timeout_tries; ++tries) {
+      slot.m_plugged = isPadPlugged(index);
+      if (!slot.m_plugged) {
+        break;
+      }
+      std::this_thread::sleep_for(timeout_delay);
     }
+    if (slot.m_plugged) {
+      std::cerr << std::format("WARNING: managed slot {} has been freed but is still plugged\n", index + 1);
+    }
+  }
+
+  /// Fill all slots except the given one
+  ///
+  /// Do nothing if state is already fine.
+  void fillAllButOne(size_t index) {
+    for (size_t i = 0; i < m_slots.size(); ++i) {
+      if (i != index && !m_slots[i].m_plugged) {
+        fillAll();
+        freeSlot(index);
+      }
+    }
+    // Nothing to do
   }
 
   /// Get state of a single slot
@@ -218,31 +257,50 @@ struct ConnectedPads {
 };
 
 
-int main() {
-  ConnectedPads pads;
-  pads.printState();
-
-  size_t const target = 0;
-
-  if (pads.isPlugged(target)) {
-    std::cout << std::format("Pad {} already plugged\n", target);
-    return 0;
-  }
-
-  std::cout << std::format("Blocking all slots except {}\n", target);
-  pads.fillAll();
-
-  std::cout << std::format("Waiting pad on slot {}...\n", target);
-  pads.printState();
-  for (;;) {
-    std::this_thread::sleep_for(100ms);
-    if (pads.updatePlugged()) {
-      pads.printState();
-      pads.fillAll();
-      if (pads.isPlugged(target)) {
-        break;
+int main(int argc, char* argv[]) {
+  size_t target = SIZE_MAX;  // invalid, checked to display usage
+  if (argc < 2) {
+    target = 0;  // default: wait for first slot
+  } else if (argc == 2) {
+    // Parse a 1-character index
+    if (std::strlen(argv[1]) == 1) {
+      char c = argv[1][0];
+      if (c >= '1' && c < '1' + XUSER_MAX_COUNT) {
+        target = c - '1';
       }
     }
+  }
+  if (target == SIZE_MAX) {
+    std::cerr << std::format("usage: {} [1-{}]\n", argv[0], XUSER_MAX_COUNT);
+    return EXIT_FAILURE;
+  }
+
+  try {
+    ConnectedPads pads;
+    pads.printState();
+
+    if (pads.isPlugged(target)) {
+      std::cout << std::format("Pad {} already plugged\n", target + 1);
+      return EXIT_SUCCESS;
+    }
+
+    pads.fillAllButOne(target);
+    std::cout << std::format("Waiting pad on slot {}...\n", target + 1);
+    pads.printState();
+    for (;;) {
+      std::this_thread::sleep_for(100ms);
+      if (pads.updatePlugged()) {
+        if (pads.isPlugged(target)) {
+          break;
+        }
+        // Fill again, in case an unmanaged gamepad has been unplugged
+        pads.fillAllButOne(target);
+        pads.printState();
+      }
+    }
+  } catch (std::exception const& e) {
+    std::cerr << "FATAL: " << e.what() << "\n";
+    return EXIT_FAILURE;
   }
 }
 
