@@ -1,8 +1,8 @@
 VIGEM_ROOT = ViGEmClient
 CPPFLAGS =  -O2 -I$(VIGEM_ROOT)/include
 CXXFLAGS = -std=c++20 -Wall -Wextra -Werror
-LDFLAGS = -lxinput -lsetupapi
-TARGET = gamepadslotter.exe
+LDFLAGS = -s -static -lxinput -lsetupapi
+TARGET = gamepad-slotter.exe
 
 default: $(TARGET)
 
